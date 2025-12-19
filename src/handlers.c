@@ -46,7 +46,7 @@ static void free_network_prov_ctx(network_prov_ctx_t **ctx)
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
 
 /* AuthMode cache structure */
-#define MAX_AUTHMODE_CACHE_SIZE 5
+#define MAX_AUTHMODE_CACHE_SIZE 8
 typedef struct {
     char ssid[33];
     wifi_auth_mode_t authmode;
