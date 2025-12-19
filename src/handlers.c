@@ -1,8 +1,8 @@
 /*
- * SPDX-FileCopyrightText: 2019-2025 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
+* SPDX-FileCopyrightText: 2019-2025 Espressif Systems (Shanghai) CO LTD
+*
+* SPDX-License-Identifier: Apache-2.0
+*/
 
 #include <stdio.h>
 #include <string.h>
@@ -164,17 +164,17 @@ static esp_err_t wifi_set_config_handler(const network_prov_config_set_wifi_data
     ESP_LOGD(TAG, "Wi-Fi Credentials Received");
 
     /* Using memcpy allows the max SSID length to be 32 bytes (as per 802.11 standard).
-     * But this doesn't guarantee that the saved SSID will be null terminated, because
-     * wifi_cfg->sta.ssid is also 32 bytes long (without extra 1 byte for null character).
-     * Although, this is not a matter for concern because esp_wifi library reads the SSID
-     * upto 32 bytes in absence of null termination */
+    * But this doesn't guarantee that the saved SSID will be null terminated, because
+    * wifi_cfg->sta.ssid is also 32 bytes long (without extra 1 byte for null character).
+    * Although, this is not a matter for concern because esp_wifi library reads the SSID
+    * upto 32 bytes in absence of null termination */
     const size_t ssid_len = strnlen(req_data->ssid, sizeof(wifi_cfg->sta.ssid));
     /* Ensure SSID less than 32 bytes is null terminated */
     memset(wifi_cfg->sta.ssid, 0, sizeof(wifi_cfg->sta.ssid));
     memcpy(wifi_cfg->sta.ssid, req_data->ssid, ssid_len);
 
     /* Using strlcpy allows both max passphrase length (63 bytes) and ensures null termination
-     * because size of wifi_cfg->sta.password is 64 bytes (1 extra byte for null character) */
+    * because size of wifi_cfg->sta.password is 64 bytes (1 extra byte for null character) */
     strlcpy((char *) wifi_cfg->sta.password, req_data->password, sizeof(wifi_cfg->sta.password));
 
 #ifdef CONFIG_NETWORK_PROV_WIFI_STA_ALL_CHANNEL_SCAN
@@ -194,9 +194,12 @@ static esp_err_t wifi_apply_config_handler(network_prov_ctx_t **ctx)
         return ESP_ERR_INVALID_STATE;
     }
     /* Try to get authmode from cache first */
-    wifi_auth_mode_t cached_authmode;
-    if (get_cached_authmode((const char*)wifi_cfg->sta.ssid, &cached_authmode)) {
-        wifi_cfg->sta.threshold.authmode = cached_authmode;
+    wifi_auth_mode_t scanned_authmode = WIFI_AUTH_WPA2_PSK; /* Default fallback */
+    bool authmode_found = false;
+    
+    if (get_cached_authmode((const char*)wifi_cfg->sta.ssid, &scanned_authmode)) {
+        authmode_found = true;
+        ESP_LOGI(TAG, "Using cached authmode %d for '%s'", scanned_authmode, wifi_cfg->sta.ssid);
     } else {
         /* Cache miss - scan WiFi to detect authmode */
         ESP_LOGI(TAG, "Scanning WiFi to detect authmode for '%s'", wifi_cfg->sta.ssid);
@@ -225,18 +228,21 @@ static esp_err_t wifi_apply_config_handler(network_prov_ctx_t **ctx)
                     if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) == ESP_OK) {
                         for (uint16_t i = 0; i < ap_count; i++) {
                             if (strcmp((const char*)ap_list[i].ssid, (const char*)wifi_cfg->sta.ssid) == 0) {
-                                wifi_cfg->sta.threshold.authmode = ap_list[i].authmode;
+                                scanned_authmode = ap_list[i].authmode;
+                                authmode_found = true;
                                 /* Cache for future use */
-                                cache_authmode((const char*)wifi_cfg->sta.ssid, ap_list[i].authmode);
+                                cache_authmode((const char*)wifi_cfg->sta.ssid, scanned_authmode);
                                 ESP_LOGI(TAG, "Detected authmode %d for '%s'", 
-                                         ap_list[i].authmode, wifi_cfg->sta.ssid);
+                                        scanned_authmode, wifi_cfg->sta.ssid);
                                 break;
                             }
                         }
                     }
                     free(ap_list);
                 }
-            } else {
+            }
+            
+            if (!authmode_found) {
                 ESP_LOGW(TAG, "No networks found, using default authmode");
             }
         } else {
@@ -244,6 +250,54 @@ static esp_err_t wifi_apply_config_handler(network_prov_ctx_t **ctx)
         }
     }
 
+    /* Set threshold.authmode correctly based on scanned network security
+    * threshold.authmode is the MINIMUM acceptable auth mode, not the exact one */
+    switch (scanned_authmode) {
+        case WIFI_AUTH_WPA3_PSK:
+            /* WPA3-only network - require WPA3 */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA3_PSK;
+            break;
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            /* WPA2/WPA3 transition mode - set threshold to WPA2 to accept both */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+            break;
+        case WIFI_AUTH_WPA2_PSK:
+            /* WPA2-only network */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+            break;
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            /* WPA/WPA2 mixed mode - set threshold to WPA to accept both */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+            break;
+        case WIFI_AUTH_WPA_PSK:
+            /* WPA-only network (legacy) - set threshold to WPA */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+            break;
+        case WIFI_AUTH_OPEN:
+        case WIFI_AUTH_WEP:
+            /* Open or WEP network - set threshold to open */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_OPEN;
+            break;
+        default:
+            /* Unknown - use WPA2 as safe default */
+            wifi_cfg->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+            break;
+    }
+
+    /* Configure SAE PWE for WPA3 support
+    * WPA3_SAE_PWE_BOTH allows both Hunt-and-Peck and Hash-to-Element methods */
+    wifi_cfg->sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    /* Configure PMF (Protected Management Frames)
+    * Required for WPA3, optional for WPA2 */
+    wifi_cfg->sta.pmf_cfg.capable = true;
+    wifi_cfg->sta.pmf_cfg.required = false;  /* Don't require PMF for WPA2 compatibility */
+
+    /* Use ESP-IDF built-in retry mechanism */
+    wifi_cfg->sta.failure_retry_cnt = 3;
+
+    ESP_LOGI(TAG, "WiFi config: scanned_auth=%d, threshold=%d, sae_pwe=%d",
+            scanned_authmode, wifi_cfg->sta.threshold.authmode, wifi_cfg->sta.sae_pwe_h2e);
 
     esp_err_t ret = network_prov_mgr_configure_wifi_sta(wifi_cfg);
     if (ret == ESP_OK) {
@@ -369,15 +423,15 @@ esp_err_t get_network_prov_handlers(network_prov_config_handlers_t *ptr)
 /*************************************************************************/
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
 static esp_err_t wifi_scan_start(bool blocking, bool passive,
-                                 uint8_t group_channels, uint32_t period_ms,
-                                 network_prov_scan_ctx_t **ctx)
+                                uint8_t group_channels, uint32_t period_ms,
+                                network_prov_scan_ctx_t **ctx)
 {
     return network_prov_mgr_wifi_scan_start(blocking, passive, group_channels, period_ms);
 }
 
 static esp_err_t wifi_scan_status(bool *scan_finished,
-                                  uint16_t *result_count,
-                                  network_prov_scan_ctx_t **ctx)
+                                uint16_t *result_count,
+                                network_prov_scan_ctx_t **ctx)
 {
     *scan_finished = network_prov_mgr_wifi_scan_finished();
     *result_count  = network_prov_mgr_wifi_scan_result_count();
@@ -385,8 +439,8 @@ static esp_err_t wifi_scan_status(bool *scan_finished,
 }
 
 static esp_err_t wifi_scan_result(uint16_t result_index,
-                                  network_prov_scan_wifi_result_t *result,
-                                  network_prov_scan_ctx_t **ctx)
+                                network_prov_scan_wifi_result_t *result,
+                                network_prov_scan_ctx_t **ctx)
 {
     const wifi_ap_record_t *record = network_prov_mgr_wifi_scan_result(result_index);
     if (!record) {
@@ -394,9 +448,9 @@ static esp_err_t wifi_scan_result(uint16_t result_index,
     }
 
     /* Compile time check ensures memory safety in case SSID length in
-     * record / result structure definition changes in future */
+    * record / result structure definition changes in future */
     _Static_assert(sizeof(result->ssid) == sizeof(record->ssid),
-                   "source and destination should be of same size");
+                "source and destination should be of same size");
     memcpy(result->ssid, record->ssid, sizeof(record->ssid));
     memcpy(result->bssid, record->bssid, sizeof(record->bssid));
     result->channel = record->primary;
